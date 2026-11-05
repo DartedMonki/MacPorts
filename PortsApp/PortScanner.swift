@@ -34,15 +34,44 @@ struct PortInfo: Identifiable, Hashable {
     }
 
     var hasParentChain: Bool { !parentChain.isEmpty }
+
+    func matches(searchText: String) -> Bool {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty ||
+            processName.localizedCaseInsensitiveContains(query) ||
+            displayName.localizedCaseInsensitiveContains(query) ||
+            String(port).contains(query)
+    }
+}
+
+struct ProcessKillRequest: Identifiable {
+    let id = UUID()
+    let ports: [PortInfo]
+    let searchQuery: String?
+
+    init(ports: [PortInfo], searchQuery: String? = nil) {
+        let ownPID = Int(ProcessInfo.processInfo.processIdentifier)
+        self.ports = ports.filter { $0.pid > 1 && $0.pid != ownPID }
+        self.searchQuery = searchQuery?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var targets: [PortInfo] {
+        var seen = Set<Int>()
+        return ports.filter { seen.insert($0.pid).inserted }
+    }
+
+    var includesSystemPorts: Bool { ports.contains { $0.isSystemPort } }
 }
 
 class PortScanner: ObservableObject {
     @Published var ports: [PortInfo] = []
     @Published var isScanning = false
+    @Published private(set) var isKilling = false
 
     private var autoRefreshTimer: Timer?
 
     func scan() {
+        guard !isScanning, !isKilling else { return }
         isScanning = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let results = Self.getOpenPorts()
@@ -65,15 +94,48 @@ class PortScanner: ObservableObject {
         autoRefreshTimer = nil
     }
 
-    func killProcess(pid: Int) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/kill")
-        process.arguments = ["-9", String(pid)]
-        try? process.run()
-        process.waitUntilExit()
+    func killProcesses(_ request: ProcessKillRequest, completion: @escaping ([String]) -> Void) {
+        guard !isKilling, !request.targets.isEmpty else { return }
+        isKilling = true
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.scan()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let commands = Self.getFullCommands()
+            var failures: [String] = []
+
+            for target in request.targets {
+                // Do not use a stale confirmation to kill a PID now owned by a different command.
+                guard let expectedCommand = target.fullCommand,
+                      commands[target.pid] == expectedCommand else {
+                    failures.append("\(target.processName) (PID \(target.pid)): process exited or changed. Refresh and try again.")
+                    continue
+                }
+
+                let process = Process()
+                let errorPipe = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/bin/kill")
+                process.arguments = ["-9", String(target.pid)]
+                process.standardError = errorPipe
+
+                do {
+                    try process.run()
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    if process.terminationStatus != 0 {
+                        let detail = String(data: errorData, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        failures.append("\(target.processName) (PID \(target.pid)): \(detail.isEmpty ? "Unable to kill process." : detail)")
+                    }
+                } catch {
+                    failures.append("\(target.processName) (PID \(target.pid)): \(error.localizedDescription)")
+                }
+            }
+
+            let errors = failures
+            DispatchQueue.main.async {
+                self?.isKilling = false
+                completion(errors)
+                self?.scan()
+            }
         }
     }
 
@@ -86,7 +148,7 @@ class PortScanner: ObservableObject {
     }
 
     private static func getFullCommands() -> [Int: String] {
-        let output = runCommand("/bin/ps", arguments: ["-eo", "pid=,command="])
+        let output = runCommand("/bin/ps", arguments: ["-ww", "-eo", "pid=,command="])
         var map: [Int: String] = [:]
         for line in output.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)

@@ -9,6 +9,10 @@ let package = Package(
             name: "PortsApp",
             path: "PortsApp",
             exclude: ["Assets.xcassets", "Info.plist", "PortsApp.entitlements"]
+        ),
+        .testTarget(
+            name: "PortsAppTests",
+            dependencies: ["PortsApp"]
         )
     ]
 )
